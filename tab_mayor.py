@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+from theme import CB_GREEN_DARK, CB_BLUE, CB_ORANGE, kpi_row, donut_progress
 
 def mostrar_tab_mayor():
     st.header("Cargar mayor contable")
@@ -11,20 +12,31 @@ def mostrar_tab_mayor():
     df_mayor = None
     if uploaded_file is not None:
         df_mayor = pd.read_excel(uploaded_file)
-        
+        df_mayor.columns = df_mayor.columns.str.strip()
+        df_mayor = df_mayor.dropna(subset=["Fecha"])
+
+        # --- Cheque (Numero solo para Comprobante == "Cheque propio") ---
+        df_mayor["Cheque"] = df_mayor["Numero"].where(df_mayor["Comprobante"] == "Cheque propio", "")
+
         st.subheader("Vista previa del mayor contable")
         st.dataframe(df_mayor.head(20))
+        st.caption(f"Columnas: {list(df_mayor.columns)}")
     
     st.markdown("---")
-    st.header("Cargar cheques depositados")
-    
-    uploaded_cheques = st.file_uploader("Sube el archivo Excel de cheques depositados", type=["xlsx", "xls"], key="cheques")
+    st.header("Cargar operaciones diarias (Tesorería)")
+
+    uploaded_cheques = st.file_uploader("Sube el archivo Excel de Operaciones Diarias", type=["xlsx", "xls"], key="cheques")
     df_cheques = None
-    if uploaded_cheques is not None:
+    if uploaded_cheques is not None and df_mayor is not None:
         df_cheques = pd.read_excel(uploaded_cheques)
-        df_cheques = df_cheques[["Numero", "Egreso", "Documento"]]  # ✅ sin tilde en cheques
-        
-        st.subheader("Vista previa de cheques depositados")
+        df_cheques = df_cheques[df_cheques["Comprobante"] == "1Boleta Deposito"]
+
+        fechas_mayor = df_mayor.loc[df_mayor["Comprobante"] == "1Boleta Deposito", "Fecha"].unique()
+        df_cheques = df_cheques[df_cheques["Fecha"].isin(fechas_mayor)]
+
+        df_cheques = df_cheques[["Numero", "Egreso", "Documento"]]
+
+        st.subheader("Vista previa de boletas de depósito")
         st.dataframe(df_cheques.head(20))
     
     st.markdown("---")
@@ -42,24 +54,24 @@ def mostrar_tab_mayor():
         st.dataframe(df_prov.head(20))
         
         dict_prov = dict(zip(df_prov["ProveedorRazonSocial"], df_prov["Cuit"]))
-        df_mayor["CUIT Proveedor"] = df_mayor["Concepto"].map(dict_prov).fillna("")
+        df_mayor["CUIT Proveedor"] = df_mayor["Razon_Social"].map(dict_prov).fillna("")
     
     st.markdown("---")
-    st.header("Cargar cartera de clientes")
-    
-    uploaded_cli = st.file_uploader("Sube el archivo Excel de clientes", type=["xlsx", "xls"], key="clientes")
-    
+    st.header("Cargar IVA Ventas")
+
+    uploaded_cli = st.file_uploader("Sube el archivo Excel de IVA Ventas", type=["xlsx", "xls"], key="iva_ventas")
+
     if uploaded_cli is not None and df_mayor is not None:
         df_cli = pd.read_excel(uploaded_cli)
-        columnas_necesarias = ["RazonSocial", "Cuit"]
+        columnas_necesarias = ["Razón Social", "CUIT"]
         df_cli = df_cli[columnas_necesarias]
-        df_cli["Cuit"] = df_cli["Cuit"].astype(str).str.replace("-", "", regex=False)
-        
-        st.subheader("Vista previa de clientes")
+        df_cli["CUIT"] = df_cli["CUIT"].astype(str).str.replace("-", "", regex=False)
+
+        st.subheader("Vista previa de IVA Ventas")
         st.dataframe(df_cli.head(20))
-        
-        dict_cli = dict(zip(df_cli["RazonSocial"], df_cli["Cuit"]))
-        df_mayor["CUIT Cliente"] = df_mayor["Concepto"].map(dict_cli).fillna("")
+
+        dict_cli = dict(zip(df_cli["Razón Social"], df_cli["CUIT"]))
+        df_mayor["CUIT Cliente"] = df_mayor["Razon_Social"].map(dict_cli).fillna("")
     
     # 🔗 Cruce con cheques depositados
     if df_mayor is not None and df_cheques is not None:
@@ -68,21 +80,21 @@ def mostrar_tab_mayor():
         nuevos_movimientos = []
         
         for idx, row in df_mayor[df_mayor["Comprobante"] == "1Boleta Deposito"].iterrows():
-            numero_mayor = row["Número"]  # ✅ con tilde en mayor
+            numero_mayor = row["Numero"]
             numero_mayor_str = str(int(numero_mayor)) if pd.notna(numero_mayor) else ""  # 🔥 elimina .0
-            
-            # Buscar coincidencias con cheques (sin tilde)
+
+            # Buscar coincidencias con cheques
             cheques_match = df_cheques[df_cheques["Numero"] == numero_mayor]
-            
+
             if not cheques_match.empty:
                 # Modificar debe a 0
                 df_mayor.at[idx, "Debe"] = 0
-                
+
                 # Crear nuevas filas
                 for _, chq in cheques_match.iterrows():
                     nuevo = {col: "" for col in df_mayor.columns}  # columnas vacías por defecto
                     nuevo["Fecha"] = row["Fecha"]
-                    nuevo["Número"] = chq["Documento"]  # Documento pasa a ser Número en mayor
+                    nuevo["Cheque"] = pd.to_numeric(chq["Documento"], errors="coerce")
                     nuevo["Concepto"] = f"Cheque Depositado {numero_mayor_str}"  # ✅ sin .0
                     nuevo["Debe"] = chq["Egreso"]
                     nuevos_movimientos.append(nuevo)
@@ -100,9 +112,24 @@ def mostrar_tab_mayor():
         df_mayor["CUIT"] = cuit_prov.replace("", pd.NA).fillna(cuit_cli).fillna("")
         df_mayor["CUIT"] = pd.to_numeric(df_mayor["CUIT"], errors="coerce").astype(float).fillna("")
 
-    
+        # --- Movimiento (Debe - Haber) ---
+        df_mayor["Movimiento"] = pd.to_numeric(df_mayor["Debe"], errors="coerce").fillna(0) - pd.to_numeric(df_mayor["Haber"], errors="coerce").fillna(0)
+
+
     # 📥 Exportar mayor final
     if df_mayor is not None:
+        cuits_identificados = (df_mayor["CUIT"] != "").sum() if "CUIT" in df_mayor.columns else 0
+        cheques_identificados = (df_mayor["Cheque"] != "").sum() if "Cheque" in df_mayor.columns else 0
+        pct_cuit = 100.0 * cuits_identificados / len(df_mayor) if len(df_mayor) else 0.0
+
+        kpi_row([
+            {"label": "Filas del mayor", "value": f"{len(df_mayor)}", "color": CB_BLUE},
+            {"label": "CUIT identificados", "value": f"{cuits_identificados}", "color": CB_GREEN_DARK},
+            {"label": "Cheques identificados", "value": f"{cheques_identificados}", "color": CB_BLUE},
+            {"label": "Total Movimiento", "value": f"${df_mayor['Movimiento'].sum():,.2f}", "color": CB_ORANGE},
+        ])
+        donut_progress(pct_cuit, "Filas con CUIT identificado")
+
         st.subheader("📊 Mayor contable final con CUIT unificado")
         st.dataframe(df_mayor.head(20))
         
